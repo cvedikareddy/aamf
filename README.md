@@ -14,13 +14,13 @@ Three mechanisms sit on top of the memory:
 
 | Mechanism | What it does | Where |
 |---|---|---|
-| **Neighbour-context transfer** | An unseen workload level inherits beliefs from nearby levels, distance-weighted. No cold start per context. | `engine.AAMF.decide` |
+| **Neighbour-context transfer** | An unseen feature cluster inherits beliefs from similar payload, time, request type, queue, and cold-start-rate contexts, weighted by similarity and sample count. | `engine.AAMF.decide` |
 | **Structure-aware exploration** | Hill-climbs over ordered tiers and prunes tiers that provably break the SLO (if tier T missed the SLO at load L, smaller tiers at load ≥ L are skipped, not tried). | `engine.AAMF.decide` |
-| **Surprise-gated forgetting** | If an outcome is far from what memory predicted, confidence in that memory is cut so the system re-learns instead of trusting a stale belief. | `engine.AAMF.learn` |
+| **Page–Hinkley drift detection** | A persistent increase in normalized loss resets only the affected workload/tier cell; the event is recorded in the episode audit log. | `engine.AAMF.learn` |
 
 Every decision comes back with a reason (`explore`, `transfer`, `exploit`, pruned tiers, forgetting events), so the memory is an audit trail rather than a black box.
 
-> **Honest scope note.** Bandit-style tuning and RL autotuners exist in research and products. The contribution here is the *framing and packaging*: architecture as a persistent, inspectable memory in a managed store, combined with context transfer, structural pruning and surprise-gated forgetting, running against real AWS billing data. It is a demonstrator, not a production controller.
+> **Honest scope note.** Bandit-style tuning and RL autotuners exist in research and products. The contribution here is the *framing and packaging*: architecture as a persistent, inspectable memory in a managed store, combined with context transfer, structural pruning and Page–Hinkley forgetting, running against Lambda measurements and estimated per-request cost. It is a demonstrator, not a production controller.
 
 ---
 
@@ -32,9 +32,11 @@ Open it, pick a session mode (demo or a real AWS session), and press **Run**. Th
 2. **Threshold rule**: a CloudWatch-alarm-style step rule (scale up on pressure, down after calm).
 3. **Static 512 MB**: a size picked by a human.
 
-The workload streams light → heavy → random mix → steady. You see, live: loss per request, which tier each controller picked, a heatmap of what AAMF has stored in DynamoDB, and a decision log explaining each AAMF choice. A checkbox injects a +400 ms downstream slowdown mid-run so you can watch surprise-gated forgetting fire. Run twice without wiping memory and AAMF starts the second run already tuned.
+The workload stream varies payload size, request type, queue depth, and time context. AAMF recalls similar feature vectors, keeps a latency/cost Pareto frontier, and lets you adjust the objective weight while the lab runs. The drift lab includes step, gradual, spike, and alternating patterns; Page–Hinkley detects sustained loss changes and forgets only the affected memory cell. A CSV feature-trace replay can compare up to 250 rows across the three controllers. The live memory graph links each decision to its neighbor evidence, and expandable audit entries show weights, estimates, confidence intervals, and drift reasons. Run twice without wiping memory and AAMF starts the second run already tuned.
 
 Latency and cost come from the Lambda `REPORT` line (billed duration and memory) returned by `Invoke(LogType=Tail)`, i.e. AWS's own numbers, not client-side stopwatch noise.
+
+The CSV is a **feature trace**, not a dump of production request bodies. Required columns are `payload_size_kb`, `request_type`, `queue_depth`, and `cold_start_rate` as a percentage from 0–100; optional columns are `work` and `extra_ms`. A real AWS replay sends each row to all three Lambda controllers and asks for confirmation first. Cold-start rate helps classify context but does not force a Lambda cold start. Counterfactual tier values are model estimates; the audit confidence interval is calculated from measured samples.
 
 ---
 
@@ -72,7 +74,7 @@ aamf/
 | Service | Role in AAMF |
 |---|---|
 | **AWS Lambda** (5 functions) | The system being tuned. Each memory tier is a separate function so switching architecture is instant (production would call `UpdateFunctionConfiguration`). |
-| **Amazon DynamoDB** (2 tables, on-demand) | `aamf-policy` = consolidated memory, key `(ctx, config)`. `aamf-episodes` = raw experience log, 7-day TTL. |
+| **Amazon DynamoDB** (2 tables, on-demand) | `aamf-policy` = consolidated feature-cluster memory, key `(ctx, config)`; `work_level` and the representative vector are item attributes. `aamf-episodes` = raw experience log, 7-day TTL. |
 | **AWS IAM** | One execution role for the Lambdas; a least-privilege policy for you (`infra/iam_policy.json`). |
 | **AWS STS** | Validates the session you open from the website (`GetCallerIdentity`). |
 
@@ -92,7 +94,7 @@ python -m venv .venv && source .venv/bin/activate        # Windows: .venv\Script
 pip install -r backend/requirements.txt
 
 # 3. provision AWS (about a minute)
-python infra/setup_aws.py --profile <your-profile> --region ap-south-1
+python infra/setup_aws.py --profile <your-profile> --region ap-southeast-2
 
 # 4. run the site
 python backend/app.py                                    # http://127.0.0.1:8000
@@ -105,7 +107,7 @@ No AWS account handy? Choose **Demo**: same site, simulated Lambda, in-process m
 Teardown:
 
 ```bash
-python infra/teardown_aws.py --profile <your-profile> --region ap-south-1
+python infra/teardown_aws.py --profile <your-profile> --region ap-southeast-2
 ```
 
 ### How the session connection works
@@ -119,13 +121,13 @@ The browser submits a mode (profile, keys, or default chain) to `POST /api/conne
 ```
  browser ──POST /api/step {policy, work}──▶ Flask
                                               │
-   1 RECALL    memory.neighbors(ctx ±2)  ───▶ DynamoDB aamf-policy (Query per nearby ctx)
-   2 DECIDE    score(tier) = remembered reward + uncertainty bonus
-               prune SLO-dominated tiers, hill-climb unseen ones
+   1 RECALL    nearest context clusters + weighted evidence ─▶ policy memory
+   2 DECIDE    choose a Pareto point using the live cost/latency weight
+               add a cautious fitted counterfactual prior and uncertainty bonus
    3 ACT       lambda.invoke(aamf-target-<tier>, LogType=Tail) ─▶ Lambda
    4 MEASURE   parse REPORT: duration, billed ms ─▶ latency, cost (µ$)
-   5 LEARN     surprise? → cut confidence │ EMA update ─▶ DynamoDB aamf-policy
-   6 LOG       episode + reason ─▶ DynamoDB aamf-episodes
+   5 LEARN     update Pareto samples │ Page–Hinkley reset for the affected cluster/tier
+   6 LOG       measurements + neighbors + estimates + audit id ─▶ DynamoDB aamf-episodes
                                               │
  browser ◀──{tier, latency, cost, loss, reason}┘
 ```
@@ -145,7 +147,7 @@ These descriptions reflect how the approaches are commonly documented; check cur
 | Predictive scaling (EC2 Auto Scaling) | Forecasts load from history | Yes, as a time-series forecast | Time only | Retrained periodically | Forecasts *how much*, not *which architecture* |
 | AWS Lambda Power Tuning | Offline sweep of memory sizes for one payload | One-shot snapshot | One payload | Manual re-run | Not continuous, not per-request-context |
 | AWS Compute Optimizer | Periodic recommendations from a historical lookback | Yes, as a lookback window | Aggregate | Slowly | Advisory, not a closed loop |
-| **AAMF** | **Recall, score, act, learn, forget** | **Yes: persistent, queryable memory** | **Yes: with neighbour transfer** | **Yes: surprise-gated forgetting** | Demonstrator scale; see below |
+| **AAMF** | **Recall, score, act, learn, forget** | **Yes: persistent, queryable memory** | **Yes: with feature-vector transfer** | **Yes: Page–Hinkley drift detection** | Demonstrator scale; see below |
 
 ### What to expect from the numbers
 
@@ -160,7 +162,8 @@ In the bundled simulator (30-seed averages over a 60-request stream) AAMF's blen
 ## 8. Limits and next steps
 
 - **Single writer.** `put_item` last-write-wins is fine for one controller; use conditional writes or atomic `ADD` counters for several.
-- **Scan-free reads.** Recall queries only neighbouring contexts, so reads stay constant-size as the table grows. The `snapshot` call used by the heatmap does scan; it is a demo view.
+- **Prototype-scale context index.** DynamoDB policy rows are scanned at session start and cached for 60 seconds so vector similarity can find nearby feature clusters without scanning on every request. This is suitable for the small experiment table; a large deployment should add a dedicated feature index or vector store.
 - **One knob.** Memory size only. The same memory schema generalises to (concurrency, instance type, cache size, batch size) with a richer context vector.
 - **Hot partition.** The episodes log uses one partition key for simplicity; shard it by day for real traffic.
-- **Next:** drive `UpdateFunctionConfiguration` on a single function, add CloudWatch Embedded Metrics for context features, and gate changes behind a canary alias.
+- **Benchmark handler deployment.** Editing `target/handler.py` locally does not change already-deployed Lambdas. Review the AWS effects, then run `infra/setup_aws.py` explicitly to update the five benchmark targets in the selected Region.
+- **Not a production router.** The lab intentionally invokes three separate benchmark functions for comparison. It does not shift user traffic, update a production function configuration, or automatically roll back a live deployment.

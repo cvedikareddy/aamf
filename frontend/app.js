@@ -217,17 +217,61 @@ async function disconnect() {
   }
 }
 
-/* ---------- workload plan (deterministic, same for every controller) ---------- */
+/* ---------- context plans and CSV traffic replay ---------- */
 function makePlan(n) {
   let seed = 12345;
   const rnd = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
-  const out = [];
+  const rows = [];
   for (let i = 0; i < n; i++) {
     const p = i / n;
-    out.push(p < 0.25 ? 1 + (i % 2) : p < 0.5 ? 5 + (i % 2) : p < 0.75 ? 1 + Math.floor(rnd() * 6) : 3);
+    const work = p < 0.25 ? 1 + (i % 2) : p < 0.5 ? 5 + (i % 2) : p < 0.75 ? 1 + Math.floor(rnd() * 6) : 3;
+    rows.push({work, context: contextFor(work, i)});
   }
-  return out;
+  return rows;
 }
+
+function contextFor(work, index) {
+  const scale = work / 3;
+  return {
+    payload_size_kb: Math.max(0, Number($('payloadSize').value || 192) * scale),
+    hour_utc: new Date().getUTCHours(),
+    request_type: $('requestType').value,
+    queue_depth: Math.max(0, Number($('queueDepth').value || 0) + ((index % 5) - 2) * Math.max(1, work)),
+    cold_start_rate: Math.max(0, Math.min(1, Number($('coldStartRate').value || 0) / 100)),
+  };
+}
+
+function parseCsv(text) {
+  const rows = []; let row = [], cell = '', quoted = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (quoted && ch === '"' && text[i + 1] === '"') { cell += '"'; i++; }
+    else if (ch === '"') quoted = !quoted;
+    else if (ch === ',' && !quoted) { row.push(cell.trim()); cell = ''; }
+    else if ((ch.charCodeAt(0) === 10 || ch.charCodeAt(0) === 13) && !quoted) {
+      if (ch.charCodeAt(0) === 13 && text.charCodeAt(i + 1) === 10) i++;
+      row.push(cell.trim()); if (row.some(v => v !== '')) rows.push(row); row = []; cell = '';
+    } else cell += ch;
+  }
+  row.push(cell.trim()); if (row.some(v => v !== '')) rows.push(row);
+  if (rows.length < 2) throw new Error('CSV needs a header and at least one request row.');
+  const headers = rows[0].map(h => h.toLowerCase());
+  const required = ['payload_size_kb','request_type','queue_depth','cold_start_rate'];
+  const missing = required.filter(h => !headers.includes(h));
+  if (missing.length) throw new Error('CSV is missing columns: ' + missing.join(', '));
+  const dataRows = rows.slice(1);
+  if (dataRows.length > 250) throw new Error('CSV is limited to 250 request rows.');
+  return dataRows.map((values, index) => {
+    const get = key => { const at = headers.indexOf(key); return at < 0 ? '' : values[at] || ''; };
+    const num = (key, fallback) => { const raw = get(key); const n = raw === '' ? fallback : Number(raw); if (!Number.isFinite(n) || n < 0) throw new Error(`CSV row ${index + 2}: ${key} must be a non-negative number.`); return n; };
+    const work = Math.max(1, Math.min(6, Math.round(num('work', Math.max(1, Math.min(6, Math.ceil(num('payload_size_kb', 192) / 192)))))));
+    return {work, extra_ms:num('extra_ms',0), context:{payload_size_kb:num('payload_size_kb',0),
+      request_type:get('request_type').toLowerCase() || 'other', queue_depth:num('queue_depth',0),
+      cold_start_rate:Math.min(1,num('cold_start_rate',0) / 100), hour_utc:new Date().getUTCHours()}};
+  });
+}
+
+let loadedTraffic = null;
 
 /* ---------- charts ---------- */
 let cLoss, cTier, labLoss, labTier;
@@ -285,7 +329,7 @@ function updateSummary() {
   $("metricMemory").textContent=""+a.n;
   $("metricSlo").textContent=""+a.viol;
   $("metricLoss").textContent=a.n&&base.n?`${Math.max(0,Math.round((1-(a.loss.reduce((x,y)=>x+y,0)/a.n)/(base.loss.reduce((x,y)=>x+y,0)/base.n))*100))}%`:"—";
-  $("metricForget").textContent="";
+  $("metricForget").textContent="" + document.querySelectorAll("#labLog .tag.forget").length;
   const counts={exploit:0,transfer:0,explore:0}; document.querySelectorAll("#log .tag").forEach(t=>{if(counts[t.textContent]!==undefined)counts[t.textContent]++});
   $("exploitCount").textContent=counts.exploit; $("transferCount").textContent=counts.transfer; $("exploreCount").textContent=counts.explore;
   if (count===0) $("metricMemory").textContent="0";
@@ -295,7 +339,21 @@ async function refreshMemory() {
   if (!connected) return;
   const m = await api("/api/memory");
   const rows = {};
-  m.policy.forEach((r) => (rows[`${r.ctx}|${r.config}`] = r));
+  const costWeight = Number($("costWeight").value || 60) / 100;
+  m.policy.forEach(r => {
+    const work = r.work_level == null ? r.ctx : r.work_level;
+    const key = `${work}|${r.config}`;
+    const n = Math.max(0, Number(r.n || 0));
+    if (!n) return;
+    const points = r.frontier || [];
+    const rowLoss = points.length ? Math.min(...points.map(p => (1-costWeight)*Number(p.latency_ms)/m.slo_ms + costWeight*Number(p.cost_ud)/m.cost_ref_ud + (Number(p.latency_ms)>m.slo_ms ? 1 : 0))) : -Number(r.ema_reward || 0);
+    const current = rows[key] || {ctx:work,config:r.config,n:0,ema_reward:0,ema_latency:0,ema_cost:0};
+    const total = current.n + n;
+    current.ema_reward = (current.ema_reward*current.n + (-rowLoss)*n) / total;
+    current.ema_latency = (current.ema_latency*current.n + Number(r.ema_latency || 0)*n) / total;
+    current.ema_cost = (current.ema_cost*current.n + Number(r.ema_cost || 0)*n) / total;
+    current.n = total; rows[key] = current;
+  });
   let html = "<table><thead><tr><th>workload</th>" + m.tiers.map((t) => `<th>${t} MB</th>`).join("") + "</tr></thead><tbody>";
   for (let w = m.work_levels[0]; w <= m.work_levels[1]; w++) {
     const cells = m.tiers.map((t) => rows[`${w}|${t}`]);
@@ -314,45 +372,90 @@ async function refreshMemory() {
   const learnedCells = new Set(m.policy.filter(r => r.n > 0).map(r => `${r.ctx}|${r.config}`));
   updateSummary();
   $("metricMemory").textContent = "" + learnedCells.size;
+  const latest = (m.episodes || []).find(ep => ep.policy === "aamf" && ep.decision_evidence);
+  if (latest) renderMemoryGraph({tier:latest.config,info:latest.decision_evidence}, latest.audit_id.slice(0,6));
 }
 
-function logDecision(r) {
-  const li = document.createElement("li");
-  const forget = r.learned && r.learned.forgot ? `<span class="tag forget">forgot (surprise ${r.learned.surprise})</span>` : "";
-  const pr = r.info.pruned && r.info.pruned.length ? ` · pruned ${r.info.pruned.join("/")} MB (SLO dominance)` : "";
-  li.innerHTML = `<span class="tag ${r.info.source}">${r.info.source}</span>${forget}
-    <b>workload ${r.work} → ${r.tier} MB</b> · ${Math.round(r.latency_ms)} ms · ${r.cost_ud.toFixed(2)} µ$ · loss ${r.loss.toFixed(2)}
-    <br>${r.info.reason}${pr}`;
-  const ul = $("log"); ul.prepend(li.cloneNode(true)); while (ul.children.length > 14) ul.lastChild.remove();
-  const lab = $("labLog"); lab.prepend(li); while (lab.children.length > 14) lab.lastChild.remove();
+function renderMemoryGraph(r, requestIndex) {
+  const root = $('memoryGraph');
+  const evidence = (r.info.neighbors || []).slice(0, 6);
+  const unique = [];
+  evidence.forEach(e => {
+    let node = unique.find(n => n.work === e.work && n.features === JSON.stringify(e.context_features || {}));
+    if (!node) { node = {work:e.work, features:JSON.stringify(e.context_features || {}), similarity:e.similarity, weight:e.weight, samples:e.samples}; unique.push(node); }
+    else { node.weight += e.weight; node.samples += e.samples; node.similarity = Math.max(node.similarity,e.similarity); }
+  });
+  const ys = unique.map((_,i) => 42 + i * (unique.length > 1 ? 150 / (unique.length - 1) : 0));
+  const lines = unique.map((n,i) => `<line x1="155" y1="120" x2="330" y2="${ys[i]}" stroke="#8aa4c0" stroke-width="${1 + n.similarity*4}" opacity="${0.25+n.similarity*.65}"><title>Similarity ${n.similarity}; weighted samples ${n.weight.toFixed(2)}</title></line><line x1="520" y1="${ys[i]}" x2="650" y2="120" stroke="#3479d1" stroke-width="${1 + Math.min(4,n.weight/5)}" opacity="${0.2+Math.min(.7,n.weight/10)}"><title>${n.samples} learned samples; weight ${n.weight.toFixed(2)}</title></line>`).join('');
+  const nodes = unique.map((n,i) => `<g><rect x="330" y="${ys[i]-17}" width="190" height="34" rx="8" fill="#f3f7fc" stroke="#9eb6cf"/><text x="342" y="${ys[i]-1}" class="graph-title">Work level ${n.work}</text><text x="342" y="${ys[i]+11}" class="graph-sub">sim ${n.similarity.toFixed(2)} · n ${n.samples} · wt ${n.weight.toFixed(1)}</text></g>`).join('');
+  const fallback = unique.length ? '' : '<line x1="155" y1="120" x2="650" y2="120" stroke="#b3bfcc" stroke-dasharray="6 5"><title>No neighbor history yet; tier selection is exploration or model based.</title></line>';
+  root.innerHTML = `<svg viewBox="0 0 800 240" role="img" aria-label="AAMF memory evidence graph">${lines}${fallback}<g><rect x="15" y="91" width="140" height="58" rx="12" fill="#e9f2ff" stroke="#3479d1" stroke-width="2"/><text x="29" y="115" class="graph-title">Request ${requestIndex}</text><text x="29" y="132" class="graph-sub">current context</text></g>${nodes}<g><rect x="650" y="91" width="135" height="58" rx="12" fill="#e5f5ed" stroke="#27805d" stroke-width="2"/><text x="664" y="115" class="graph-title">${r.tier} MB</text><text x="664" y="132" class="graph-sub">chosen tier</text></g></svg>`;
+  $('graphStatus').textContent = `${unique.length} neighbor context${unique.length === 1 ? '' : 's'} · ${Math.round(r.info.objective.cost_weight*100)}% cost objective`;
+}
+
+function logDecision(r, requestIndex) {
+  const li = document.createElement('li');
+  const forget = r.learned && r.learned.drift_detected ? `<span class="tag forget">Page–Hinkley drift ${r.learned.drift_score}</span>` : '';
+  const pr = r.info.pruned && r.info.pruned.length ? ` · pruned ${r.info.pruned.join('/')} MB (SLO dominance)` : '';
+  const neighbors = (r.info.neighbors || []).slice(0,4).map(n => `<tr><td>work ${escHtml(n.work)}</td><td>${escHtml(n.tier)} MB</td><td>${Number(n.similarity).toFixed(3)}</td><td>${Number(n.weight).toFixed(2)}</td><td>${n.samples}</td></tr>`).join('');
+  const candidates = (r.info.candidates || []).map(c => `<tr><td>${c.tier} MB</td><td>${c.remembered_loss}</td><td>${c.predicted_loss == null ? '—' : c.predicted_loss}</td><td>${c.ci ? `${c.ci.low}–${c.ci.high} (n=${c.ci.n})` : '—'}</td></tr>`).join('');
+  const cf = r.info.counterfactual ? `${escHtml(r.info.counterfactual.model)} · ${r.info.counterfactual.samples} nearby measured AAMF episodes` : 'Not enough varied AAMF measurements to fit the model yet.';
+  li.innerHTML = `<span class="tag ${escHtml(r.info.source)}">${escHtml(r.info.source)}</span>${forget}
+    <b>request ${requestIndex} · work ${r.work} → ${r.tier} MB</b> · ${Math.round(r.latency_ms)} ms · ${r.cost_ud.toFixed(2)} µ$ · loss ${r.loss.toFixed(2)}
+    <br>${escHtml(r.info.reason)}${escHtml(pr)}
+    <details class="audit-evidence"><summary>Audit ${escHtml(r.audit_id)} · inspect evidence</summary><p>Objective weights: latency ${r.info.objective.latency_weight}, cost ${r.info.objective.cost_weight}. Observed ${Math.round(r.latency_ms)} ms and ${r.cost_ud.toFixed(3)} µ$. Counterfactual model: ${cf}. ${r.learned.drift_reason ? escHtml(r.learned.drift_reason) : ''}</p>
+    <h4>Candidate estimates and 95% intervals</h4><div class="table-scroll"><table class="service-table"><thead><tr><th>Tier</th><th>Remembered loss</th><th>Counterfactual loss</th><th>95% interval</th></tr></thead><tbody>${candidates || '<tr><td colspan="4">No candidate evidence.</td></tr>'}</tbody></table></div>
+    <h4>Neighbor evidence · similarity × sample count</h4><div class="table-scroll"><table class="service-table"><thead><tr><th>Context</th><th>Tier</th><th>Similarity</th><th>Weight</th><th>Samples</th></tr></thead><tbody>${neighbors || '<tr><td colspan="5">No similar context observations yet.</td></tr>'}</tbody></table></div></details>`;
+  const ul = $('log'); ul.prepend(li.cloneNode(true)); while (ul.children.length > 14) ul.lastChild.remove();
+  const lab = $('labLog'); lab.prepend(li); while (lab.children.length > 14) lab.lastChild.remove();
+  if (r.policy === 'aamf') renderMemoryGraph(r, requestIndex);
   updateSummary();
 }
 
 /* ---------- run loop ---------- */
+function driftExtra(pattern, index, total) {
+  const progress = index / Math.max(1,total-1);
+  if (pattern === 'step') return progress >= 0.5 ? 400 : 0;
+  if (pattern === 'gradual') return progress < 0.2 ? 0 : Math.round((progress - 0.2) / 0.8 * 600);
+  if (pattern === 'spikes') return ((index * 17 + 11) % 13) < 3 ? 600 : 0;
+  if (pattern === 'alternating') return Math.floor(index / 3) % 2 ? 400 : 0;
+  return 0;
+}
+
 async function run() {
-  running = true; resetData(); $("log").innerHTML = "";
-  $("btnRun").disabled = true; $("btnReset").disabled = true; $("btnStop").disabled = false;
-  const n = parseInt($("steps").value, 10); plan = makePlan(n);
+  running = true; resetData(); $('log').innerHTML = ''; $('labLog').innerHTML = '';
+  $('btnRun').disabled = true; $('btnReset').disabled = true; $('btnStop').disabled = false;
+  const csvRows = loadedTraffic;
+  const n = csvRows ? csvRows.length : parseInt($('steps').value, 10);
+  plan = csvRows || makePlan(n);
+  if (sessionInfo && sessionInfo.mode !== 'demo' && !window.confirm(`Replay ${n} requests through 3 controllers (${n*3} Lambda invocations) in ${sessionInfo.region}. AWS charges may apply. Continue?`)) {
+    running = false; $('btnStop').disabled = true; $('btnRun').disabled = false; $('btnReset').disabled = false; return;
+  }
   try {
     for (let i = 0; i < n && running; i++) {
-      const extra = $("drift").checked ? 400 : 0;
-      const res = await Promise.all(POLICIES.map((p) => api("/api/step", { policy: p.id, work: plan[i], extra_ms: extra })));
-      res.forEach((r) => {
+      const row = plan[i];
+      const extra = Math.min(2000, Math.max(driftExtra($('driftPattern').value, i, n), row.extra_ms || 0));
+      const costWeight = Number($('costWeight').value) / 100;
+      const res = await Promise.all(POLICIES.map(p => api('/api/step', {
+        policy:p.id, work:row.work, context:row.context, extra_ms:extra, cost_weight:costWeight
+      })));
+      res.forEach(r => {
         const d = data[r.policy];
         d.loss.push(r.loss); d.tier.push(r.tier); d.lat += r.latency_ms; d.cost += r.cost_ud; d.n++;
         if (r.violation) d.viol++;
         if (d.last !== null && d.last !== r.tier) d.sw++;
         d.last = r.tier;
-        if (r.policy === "aamf") logDecision(r);
+        if (r.policy === 'aamf') logDecision(r, i+1);
       });
       drawCharts(); drawScore();
-      $("progress").textContent = `Request ${i + 1} / ${n} · workload level ${plan[i]}${extra ? " · +400 ms downstream slowdown" : ""}`;
-      if (i % 3 === 2 || i === n - 1) await refreshMemory();
+      $('progress').className = 'status';
+      $('progress').textContent = `Request ${i+1} / ${n} · work ${row.work} · payload ${Math.round(row.context.payload_size_kb)} KB · queue ${Math.round(row.context.queue_depth)} · +${extra} ms injected`;
+      if (i % 3 === 2 || i === n-1) await refreshMemory();
     }
-    $("progress").textContent += running ? " · done" : " · stopped";
-  } catch (e) { toast(e.message); $("progress").className = "status err"; $("progress").textContent = e.message; }
-  running = false; $("btnStop").disabled = true;
-  showConn(await api("/api/status")); await refreshMemory().catch(() => {});
+    $('progress').textContent += running ? ' · done' : ' · stopped';
+  } catch (e) { toast(e.message); $('progress').className = 'status err'; $('progress').textContent = e.message; }
+  running = false; $('btnStop').disabled = true;
+  try { showConn(await api('/api/status')); await refreshMemory(); } catch (_) {}
 }
 
 async function wipe() {
@@ -381,6 +484,18 @@ window.addEventListener("DOMContentLoaded", async () => {
   $("themeToggle").addEventListener("click", () => { document.body.classList.toggle("dark"); $("themeToggle").querySelector("small").textContent=document.body.classList.contains("dark")?"Dark interface":"Light interface"; [cLoss,cTier,labLoss,labTier].filter(Boolean).forEach(c=>{c.options.scales.x.ticks.color=document.body.classList.contains("dark")?"#a5b4c8":"#8a96a7";c.options.scales.y.ticks.color=document.body.classList.contains("dark")?"#a5b4c8":"#8a96a7";c.options.scales.x.grid.color=document.body.classList.contains("dark")?"#2b3b51":"#e8edf3";c.options.scales.y.grid.color=document.body.classList.contains("dark")?"#2b3b51":"#e8edf3";c.update("none")}); });
   $("btnDisconnect").addEventListener("click", disconnect);
   $("btnRun").addEventListener("click", run);
+  $("costWeight").addEventListener("input", () => { const c=Number($("costWeight").value); $("costWeightLabel").textContent=`${c}% cost · ${100-c}% latency`; });
+  $("trafficCsv").addEventListener("change", async ev => {
+    const file=ev.target.files[0];
+    if (!file) { loadedTraffic=null; const option=$("steps").querySelector("option[value='csv']"); if(option) option.remove(); return; }
+    try {
+      loadedTraffic=parseCsv(await file.text());
+      let option=$("steps").querySelector("option[value='csv']");
+      if(!option){option=document.createElement("option");option.value="csv";$("steps").appendChild(option);}
+      option.textContent=`CSV trace · ${loadedTraffic.length} rows`; $("steps").value="csv";
+      $("progress").textContent=`Loaded ${loadedTraffic.length} CSV feature rows. Run to replay against all three controllers.`;
+    } catch(e) { loadedTraffic=null; ev.target.value=''; toast(e.message); }
+  });
   $("btnStop").addEventListener("click", () => (running = false));
   $("btnReset").addEventListener("click", () => wipe().catch((e) => toast(e.message)));
   const initialView=location.hash.slice(1); if(initialView && $("view-"+initialView)){document.querySelector(`[data-view="${initialView}"]`)?.click();}

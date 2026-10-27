@@ -1,23 +1,19 @@
-"""AAMF backend: serves the website and a tiny JSON API.
-
-    python backend/app.py        ->  http://127.0.0.1:8000
-"""
+"""AAMF Flask site and JSON API."""
 import os
 import sys
+import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from flask import Flask, jsonify, request, send_from_directory, session
+from werkzeug.exceptions import HTTPException
 
-from flask import Flask, jsonify, request, send_from_directory, session  # noqa: E402
-from werkzeug.exceptions import HTTPException  # noqa: E402
-
-import config as C  # noqa: E402
-from aws_session import STORE, ConnectError  # noqa: E402
-from engine import loss_of  # noqa: E402
-from invoker import invoke  # noqa: E402
+import config as C
+from aws_session import STORE, ConnectError
+from engine import default_context, loss_of, normalize_context
+from invoker import invoke
 
 INFRA = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "infra"))
 sys.path.insert(0, INFRA)
-
 FRONTEND = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frontend")
 
 app = Flask(__name__)
@@ -33,18 +29,17 @@ def current():
 
 
 @app.errorhandler(ConnectError)
-def _connect_error(e):
-    return jsonify(error=str(e)), e.status
+def _connect_error(error):
+    return jsonify(error=str(error)), error.status
 
 
 @app.errorhandler(Exception)
-def _any_error(e):
-    if isinstance(e, HTTPException):
-        return e
-    return jsonify(error=f"{type(e).__name__}: {e}"), 500
+def _any_error(error):
+    if isinstance(error, HTTPException):
+        return error
+    return jsonify(error=f"{type(error).__name__}: {error}"), 500
 
 
-# ---- static site --------------------------------------------------------------------
 @app.get("/")
 def index():
     return send_from_directory(FRONTEND, "index.html")
@@ -55,18 +50,17 @@ def assets(name):
     return send_from_directory(FRONTEND, name)
 
 
-# ---- session ------------------------------------------------------------------------
 @app.post("/api/connect")
 def connect():
-    b = request.get_json(force=True) or {}
-    old = session.get("sid")
-    s = STORE.open(mode=b.get("mode", "demo"), region=b.get("region"), profile=b.get("profile"),
-                   access_key=b.get("access_key"), secret_key=b.get("secret_key"),
-                   token=b.get("session_token"))
-    if old and old != s.sid:
-        STORE.close(old)
-    session["sid"] = s.sid
-    return jsonify(s.describe())
+    body = request.get_json(force=True) or {}
+    previous = session.get("sid")
+    app_session = STORE.open(mode=body.get("mode", "demo"), region=body.get("region"),
+                             profile=body.get("profile"), access_key=body.get("access_key"),
+                             secret_key=body.get("secret_key"), token=body.get("session_token"))
+    if previous and previous != app_session.sid:
+        STORE.close(previous)
+    session["sid"] = app_session.sid
+    return jsonify(app_session.describe())
 
 
 @app.post("/api/disconnect")
@@ -77,29 +71,30 @@ def disconnect():
 
 @app.post("/api/provision")
 def provision():
-    s = current()
-    if s.demo or s.boto_session is None:
+    app_session = current()
+    if app_session.demo or app_session.boto_session is None:
         raise ConnectError("Connect to an AWS profile or credentials before creating AAMF resources.", 400)
-    if not s.missing:
-        return jsonify(s.describe())
+    if not app_session.missing:
+        return jsonify(app_session.describe())
     from setup_aws import provision_session
     from botocore.exceptions import ClientError, NoCredentialsError
     try:
-        provision_session(s.boto_session, s.region)
-        return jsonify(s.refresh_resources())
+        provision_session(app_session.boto_session, app_session.region)
+        return jsonify(app_session.refresh_resources())
     except NoCredentialsError:
-        profile = getattr(s.boto_session, "profile_name", None) or "default"
-        return jsonify(error=f"AWS credentials are unavailable or expired. Run aws login --profile {profile!r} in PowerShell, then reconnect AAMF."), 401
-    except ClientError as e:
-        error = e.response.get("Error", {})
-        code = error.get("Code", "AWSServiceError")
-        status_code = 403 if code in ("AccessDenied", "AccessDeniedException", "UnauthorizedOperation") else 502
-        return jsonify(error=f"AWS setup failed ({code}). Check the AWS permissions required by AAMF."), status_code
+        profile = getattr(app_session.boto_session, "profile_name", None) or "default"
+        return jsonify(error=f"AWS credentials are unavailable or expired. Run aws login --profile {profile!r}, then reconnect AAMF."), 401
+    except ClientError as error:
+        detail = error.response.get("Error", {})
+        code = detail.get("Code", "AWSServiceError")
+        status = 403 if code in ("AccessDenied", "AccessDeniedException", "UnauthorizedOperation") else 502
+        return jsonify(error=f"AWS setup failed ({code}). Check the AWS permissions required by AAMF."), status
+
 
 @app.get("/api/aws/<service>")
 def aws_service(service):
-    s = current()
-    if s.demo or s.boto_session is None:
+    app_session = current()
+    if app_session.demo or app_session.boto_session is None:
         raise ConnectError("Connect with an AWS profile or credentials to load live service data.", 400)
     from aws_services import cloudtrail_events, cloudwatch, config_status, ec2_fleet, resources
     from botocore.exceptions import ClientError, NoCredentialsError
@@ -109,66 +104,78 @@ def aws_service(service):
     if handler is None:
         return jsonify(error="Unknown AWS service view."), 404
     try:
-        return jsonify(handler(s.boto_session))
+        return jsonify(handler(app_session.boto_session))
     except NoCredentialsError:
-        profile = getattr(s.boto_session, "profile_name", None) or "default"
-        return jsonify(error=f"AWS credentials are unavailable or expired. Run aws login --profile {profile!r} in PowerShell, then reconnect AAMF."), 401
-    except ClientError as e:
-        error = e.response.get("Error", {})
-        code = error.get("Code", "AWSServiceError")
-        status_code = 403 if code in ("AccessDenied", "AccessDeniedException", "UnauthorizedOperation") else 502
-        return jsonify(error=f"{service} read failed ({code}): {error.get('Message', 'AWS request failed')}"), status_code
+        profile = getattr(app_session.boto_session, "profile_name", None) or "default"
+        return jsonify(error=f"AWS credentials are unavailable or expired. Run aws login --profile {profile!r}, then reconnect AAMF."), 401
+    except ClientError as error:
+        detail = error.response.get("Error", {})
+        code = detail.get("Code", "AWSServiceError")
+        status = 403 if code in ("AccessDenied", "AccessDeniedException", "UnauthorizedOperation") else 502
+        return jsonify(error=f"{service} read failed ({code}): {detail.get('Message', 'AWS request failed')}"), status
+
+
 @app.get("/api/status")
 def status():
-    s = STORE.get(session.get("sid"))
-    return jsonify(s.describe() if s else {"connected": False})
+    app_session = STORE.get(session.get("sid"))
+    return jsonify(app_session.describe() if app_session else {"connected": False})
 
 
-# ---- one decision cycle: decide -> invoke -> learn -> log ---------------------------
 @app.post("/api/step")
 def step():
-    s = current()
-    if not s.demo and s.missing:
-        raise ConnectError("AWS resources missing: run infra/setup_aws.py first (" +
-                           ", ".join(s.missing[:3]) + "...)", 409)
-    b = request.get_json(force=True)
-    pol_id = b["policy"]
-    work = max(C.WORK_MIN, min(int(b["work"]), C.WORK_MAX))
-    extra = max(0, min(int(b.get("extra_ms", 0)), 2000))
-    pol = s.policies[pol_id]
+    app_session = current()
+    if not app_session.demo and app_session.missing:
+        raise ConnectError("AWS resources missing: run Setup to create required AAMF resources.", 409)
+    body = request.get_json(force=True) or {}
+    policy_id = body.get("policy")
+    if policy_id not in app_session.policies:
+        raise ConnectError("Choose a valid controller.", 400)
+    try:
+        work = max(C.WORK_MIN, min(int(body.get("work", C.WORK_MIN)), C.WORK_MAX))
+        extra_ms = max(0, min(int(body.get("extra_ms", 0)), 2000))
+        cost_weight = max(0.0, min(float(body.get("cost_weight", C.COST_W)), 1.0))
+        context = normalize_context(body.get("context") or default_context(work), work)
+    except (TypeError, ValueError) as error:
+        raise ConnectError(f"Invalid workload input: {error}", 400) from error
 
-    tier, info = pol.decide(work)
-    res = invoke(s, tier, work, extra)
-    learned = pol.learn(work, tier, res)
-    loss = loss_of(res["latency_ms"], res["cost_ud"])
-
-    s.memory.log_episode({
-        "policy": pol_id, "ctx": work, "config": tier, "source": info["source"],
-        "latency_ms": res["latency_ms"], "cost_ud": res["cost_ud"], "loss": loss,
-        "extra_ms": extra, "forgot": bool(learned.get("forgot", False)),
-    })
+    policy = app_session.policies[policy_id]
+    tier, info = policy.decide(work, context=context, cost_weight=cost_weight, extra_ms=extra_ms)
+    result = invoke(app_session, tier, work, extra_ms, context)
+    learned = policy.learn(work, tier, result, context=context, cost_weight=cost_weight)
+    loss = loss_of(result["latency_ms"], result["cost_ud"], cost_weight)
+    audit_id = uuid.uuid4().hex
+    episode = {
+        "audit_id": audit_id, "policy": policy_id, "ctx": work, "config": tier,
+        "context_features": context, "cost_weight": cost_weight, "source": info["source"],
+        "decision_reason": info.get("reason", ""), "decision_evidence": info,
+        "learning_result": learned, "latency_ms": result["latency_ms"],
+        "billed_ms": result["billed_ms"], "cost_ud": result["cost_ud"],
+        "loss": loss, "extra_ms": extra_ms, "forgot": bool(learned.get("forgot", False)),
+    }
+    app_session.memory.log_episode(episode)
     return jsonify({
-        "policy": pol_id, "work": work, "tier": tier, "extra_ms": extra,
-        "latency_ms": res["latency_ms"], "billed_ms": res["billed_ms"],
-        "cost_ud": res["cost_ud"], "cold_ms": res["cold_ms"], "loss": loss,
-        "violation": res["latency_ms"] > C.SLO_MS,
-        "info": info, "learned": learned,
+        "audit_id": audit_id, "policy": policy_id, "work": work, "context": context,
+        "tier": tier, "extra_ms": extra_ms, "cost_weight": cost_weight,
+        "latency_ms": result["latency_ms"], "billed_ms": result["billed_ms"],
+        "cost_ud": result["cost_ud"], "cold_ms": result["cold_ms"], "loss": loss,
+        "violation": result["latency_ms"] > C.SLO_MS, "info": info, "learned": learned,
     })
 
 
-# ---- memory inspection / reset ------------------------------------------------------
 @app.get("/api/memory")
 def memory():
-    s = current()
-    return jsonify({"policy": s.memory.snapshot(), "episodes": s.memory.recent(15),
-                    "tiers": C.TIERS, "work_levels": [C.WORK_MIN, C.WORK_MAX], "slo_ms": C.SLO_MS})
+    app_session = current()
+    return jsonify({"policy": app_session.memory.snapshot(), "episodes": app_session.memory.recent(80),
+                    "tiers": C.TIERS, "work_levels": [C.WORK_MIN, C.WORK_MAX],
+                    "context_features": list(C.CONTEXT_FEATURES), "slo_ms": C.SLO_MS,
+                    "cost_ref_ud": C.COST_REF_UD})
 
 
 @app.post("/api/reset")
 def reset():
-    s = current()
-    s.memory.reset()
-    s.reset_policies()
+    app_session = current()
+    app_session.memory.reset()
+    app_session.reset_policies()
     return jsonify(ok=True)
 
 

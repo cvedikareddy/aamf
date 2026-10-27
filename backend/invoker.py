@@ -22,10 +22,10 @@ def _cost_ud(tier: int, billed_ms: float) -> float:
     return usd * 1e6
 
 
-def invoke_real(lambda_client, tier: int, work: int, extra_ms: int) -> dict:
+def invoke_real(lambda_client, tier: int, work: int, extra_ms: int, context_features=None) -> dict:
     resp = lambda_client.invoke(
         FunctionName=C.fn_name(tier),
-        Payload=json.dumps({"work": work, "extra_ms": extra_ms}).encode(),
+        Payload=json.dumps({"work": work, "extra_ms": extra_ms, "context": context_features or {}}).encode(),
         LogType="Tail",
     )
     body = resp["Payload"].read()
@@ -47,17 +47,23 @@ def invoke_real(lambda_client, tier: int, work: int, extra_ms: int) -> dict:
     }
 
 
-def invoke_sim(tier: int, work: int, extra_ms: int) -> dict:
-    share = min(tier / 1769.0, 1.0)                 # Lambda gives ~1 vCPU at 1769 MB
-    cpu_ms = C.SIM_CPU_MS * work / max(share, 0.05)
-    dur = (cpu_ms + 150.0 + extra_ms) * random.lognormvariate(0, 0.05)
+def invoke_sim(tier: int, work: int, extra_ms: int, context_features=None) -> dict:
+    context = context_features or {}
+    share = min(tier / 1769.0, 1.0)
+    payload_factor = 1.0 + min(float(context.get("payload_size_kb", 0)) / 1024.0, 4.0) * 0.25
+    request_type = str(context.get("request_type", "read")).lower()
+    type_factor = 1.2 if request_type in ("write", "update", "delete", "batch") else 1.0
+    cpu_ms = C.SIM_CPU_MS * work * payload_factor * type_factor / max(share, 0.05)
+    queue_wait = min(float(context.get("queue_depth", 0)) * 2.0, 300.0)
+    cold_rate = max(0.0, min(float(context.get("cold_start_rate", 0.06)), 1.0))
+    cold = 180.0 if random.random() < cold_rate else 0.0
+    dur = (cpu_ms + 150.0 + queue_wait + extra_ms + cold) * random.lognormvariate(0, 0.05)
     billed = math.ceil(dur)
-    cold = 180.0 if random.random() < 0.06 else 0.0
     return {"latency_ms": round(dur, 2), "billed_ms": float(billed),
             "cost_ud": _cost_ud(tier, billed), "cold_ms": cold}
 
 
-def invoke(app_session, tier: int, work: int, extra_ms: int) -> dict:
+def invoke(app_session, tier: int, work: int, extra_ms: int, context_features=None) -> dict:
     if app_session.demo:
-        return invoke_sim(tier, work, extra_ms)
-    return invoke_real(app_session.lambda_client, tier, work, extra_ms)
+        return invoke_sim(tier, work, extra_ms, context_features)
+    return invoke_real(app_session.lambda_client, tier, work, extra_ms, context_features)
